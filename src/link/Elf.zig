@@ -783,8 +783,9 @@ pub const abbrev_compile_unit = 1;
 pub const abbrev_subprogram = 2;
 pub const abbrev_subprogram_retvoid = 3;
 pub const abbrev_base_type = 4;
-pub const abbrev_pad1 = 5;
-pub const abbrev_parameter = 6;
+pub const abbrev_ptr_type = 5;
+pub const abbrev_pad1 = 6;
+pub const abbrev_parameter = 7;
 
 pub fn flush(self: *Elf, comp: *Compilation) !void {
     if (self.base.options.emit == null) {
@@ -871,9 +872,21 @@ pub fn flushModule(self: *Elf, comp: *Compilation) !void {
             DW.AT.byte_size,
             DW.FORM.data1,
             DW.AT.name,
-            DW.FORM.string, 0, 0, // table sentinel
-            abbrev_pad1, DW.TAG.unspecified_type, DW.CHILDREN.no, // header
-            0,                0, // table sentinel
+            DW.FORM.string,
+            0,
+            0, // table sentinel
+            abbrev_ptr_type,
+            DW.TAG.pointer_type,
+            DW.CHILDREN.no, // header
+            DW.AT.type,
+            DW.FORM.ref4,
+            0,
+            0, // table sentinel
+            abbrev_pad1,
+            DW.TAG.unspecified_type,
+            DW.CHILDREN.no, // header
+            0,
+            0, // table sentinel
             abbrev_parameter,
             DW.TAG.formal_parameter, DW.CHILDREN.no, // header
             DW.AT.location,          DW.FORM.exprloc,
@@ -2381,16 +2394,25 @@ fn finishUpdateDecl(
     // Now we emit the .debug_info types of the Decl. These will count towards the size of
     // the buffer, so we have to do it before computing the offset, and we can't perform the actual
     // relocations yet.
+    var dbg_type_relocs = std.ArrayList(usize).init(self.base.allocator);
+    defer dbg_type_relocs.deinit();
     {
         var it = dbg_info_type_relocs.iterator();
         while (it.next()) |entry| {
             entry.value_ptr.off = @intCast(u32, dbg_info_buffer.items.len);
-            try self.addDbgInfoType(entry.key_ptr.*, dbg_info_buffer);
+            try self.addDbgInfoType(entry.key_ptr.*, dbg_info_buffer, &dbg_type_relocs);
         }
     }
 
     const text_block = &decl.link.elf;
     try self.updateDeclDebugInfoAllocation(text_block, @intCast(u32, dbg_info_buffer.items.len));
+
+    for (dbg_type_relocs.items) |off| {
+        const slice = dbg_info_buffer.items[off..][0..4];
+        const value = mem.readIntLittle(u32, slice) + text_block.dbg_info_off;
+        log.warn("value = {x}", .{value});
+        mem.writeIntLittle(u32, slice, value);
+    }
 
     const target_endian = self.base.options.target.cpu.arch.endian();
 
@@ -2701,7 +2723,12 @@ pub fn updateDecl(self: *Elf, module: *Module, decl: *Module.Decl) !void {
 }
 
 /// Asserts the type has codegen bits.
-fn addDbgInfoType(self: *Elf, ty: Type, dbg_info_buffer: *std.ArrayList(u8)) !void {
+fn addDbgInfoType(
+    self: *Elf,
+    ty: Type,
+    dbg_info_buffer: *std.ArrayList(u8),
+    dbg_type_relocs: *std.ArrayList(usize),
+) error{OutOfMemory}!void {
     switch (ty.zigTypeTag()) {
         .Void => unreachable,
         .NoReturn => unreachable,
@@ -2741,6 +2768,21 @@ fn addDbgInfoType(self: *Elf, ty: Type, dbg_info_buffer: *std.ArrayList(u8)) !vo
                 log.debug("TODO implement .debug_info for type '{}'", .{ty});
                 try dbg_info_buffer.append(abbrev_pad1);
             }
+        },
+        .Pointer => blk: {
+            if (ty.isSlice()) {
+                log.debug("TODO implement .debug_info for type '{}'", .{ty});
+                try dbg_info_buffer.append(abbrev_pad1);
+                break :blk;
+            }
+            try dbg_info_buffer.ensureUnusedCapacity(5);
+            dbg_info_buffer.appendAssumeCapacity(abbrev_ptr_type);
+            // DW.AT.type, DW.FORM.ref4
+            const off = @intCast(u32, 4 + dbg_info_buffer.items.len);
+            try dbg_type_relocs.append(dbg_info_buffer.items.len);
+            log.warn("off = {x}", .{off});
+            mem.writeIntLittle(u32, dbg_info_buffer.addManyAsArrayAssumeCapacity(4), off);
+            try self.addDbgInfoType(ty.childType(), dbg_info_buffer, dbg_type_relocs);
         },
         else => {
             log.debug("TODO implement .debug_info for type '{}'", .{ty});
